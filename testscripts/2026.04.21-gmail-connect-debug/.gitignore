@@ -1,0 +1,6 @@
+/.env
+/.env.example
+/input/*
+!/input/.gitkeep
+/output/*
+!/output/.gitkeep
