@@ -1,0 +1,23 @@
+{
+  "name": "openpoke-voice-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/agent.ts dev",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/agent.js start"
+  },
+  "dependencies": {
+    "@livekit/agents": "1.2.7",
+    "@livekit/agents-plugin-deepgram": "1.2.7",
+    "@livekit/rtc-node": "0.13.25",
+    "dotenv": "^16.4.7",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
+  }
+}

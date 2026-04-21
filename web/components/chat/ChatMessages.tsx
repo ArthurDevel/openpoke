@@ -8,11 +8,22 @@ interface ChatMessagesProps {
   isWaitingForResponse: boolean;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
   onScroll: () => void;
+  className?: string;
 }
 
-export function ChatMessages({ messages, isWaitingForResponse, scrollContainerRef, onScroll }: ChatMessagesProps) {
+export function ChatMessages({
+  messages,
+  isWaitingForResponse,
+  scrollContainerRef,
+  onScroll,
+  className,
+}: ChatMessagesProps) {
   return (
-    <div ref={scrollContainerRef} onScroll={onScroll} className="flex h-[70vh] flex-col gap-2 overflow-y-auto p-4">
+    <div
+      ref={scrollContainerRef}
+      onScroll={onScroll}
+      className={clsx('flex h-[70vh] flex-col gap-2 overflow-y-auto p-4', className)}
+    >
       {messages.length === 0 && <EmptyState />}
 
       {messages.map((message, index) => {
