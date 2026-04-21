@@ -61,6 +61,11 @@ class Settings(BaseModel):
     openrouter_api_key: Optional[str] = Field(default=os.getenv("OPENROUTER_API_KEY"))
     composio_gmail_auth_config_id: Optional[str] = Field(default=os.getenv("COMPOSIO_GMAIL_AUTH_CONFIG_ID"))
     composio_api_key: Optional[str] = Field(default=os.getenv("COMPOSIO_API_KEY"))
+    livekit_url: Optional[str] = Field(default=os.getenv("LIVEKIT_URL"))
+    livekit_api_key: Optional[str] = Field(default=os.getenv("LIVEKIT_API_KEY"))
+    livekit_api_secret: Optional[str] = Field(default=os.getenv("LIVEKIT_API_SECRET"))
+    livekit_room_prefix: str = Field(default=os.getenv("LIVEKIT_ROOM_PREFIX", "openpoke"))
+    livekit_agent_name: str = Field(default=os.getenv("LIVEKIT_AGENT_NAME", "openpoke-voice-agent"))
 
     # HTTP behaviour
     cors_allow_origins_raw: str = Field(default=os.getenv("OPENPOKE_CORS_ALLOW_ORIGINS", "*"))

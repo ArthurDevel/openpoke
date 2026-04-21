@@ -6,6 +6,7 @@ OpenPoke is a simplified, open-source take on [Interaction Company’s](https://
 - Gmail tooling via [Composio](https://composio.dev/) for drafting/replying/forwarding without leaving chat.
 - Trigger scheduler and background watchers for reminders and "important email" alerts.
 - Next.js web UI that proxies everything through the shared `.env`, so plugging in API keys is the only setup.
+- Optional Talk mode powered by a LiveKit voice agent that relays each spoken turn into the existing messaging backend.
 
 ## Requirements
 - Python 3.10+
@@ -61,15 +62,37 @@ OpenPoke is a simplified, open-source take on [Interaction Company’s](https://
    ```bash
    npm install --prefix web
    ```
-7. **Start the FastAPI server:**
+7. **Optional: enable LiveKit-backed Talk mode.** Add these values to `.env` if you want the app to run the voice agent used by *Talk*:
+   ```bash
+   LIVEKIT_URL=wss://your-project.livekit.cloud
+   LIVEKIT_API_KEY=your_livekit_api_key_here
+   LIVEKIT_API_SECRET=your_livekit_api_secret_here
+   LIVEKIT_ROOM_PREFIX=openpoke
+   LIVEKIT_AGENT_NAME=openpoke-voice-agent
+   DEEPGRAM_API_KEY=your_deepgram_api_key_here
+   OPENPOKE_SERVER_URL=http://localhost:8001
+   LIVEKIT_STT_MODEL=deepgram/nova-3:en
+   LIVEKIT_LLM_MODEL=openai/gpt-4.1-mini
+   LIVEKIT_TTS_MODEL=aura-2-andromeda-en
+   ```
+8. **Install the voice-agent dependencies** if you want Talk mode:
+   ```bash
+   npm install --prefix voice-agent
+   ```
+9. **Start the FastAPI server:**
    ```bash
    python -m server.server --reload
    ```
-8. **Start the Next.js app (new terminal):**
+10. **Start the Next.js app (new terminal):**
    ```bash
    npm run dev --prefix web
    ```
-9. **Connect Gmail for email workflows.** With both services running, open [http://localhost:3000](http://localhost:3000), head to *Settings → Gmail*, and complete the Composio OAuth flow. This step is required for email drafting, replies, and the important-email monitor.
+11. **Start the LiveKit voice agent** in another terminal if you want Talk mode:
+   ```bash
+   npm run dev --prefix voice-agent
+   ```
+   Or use `./start-dev.sh` after installing both `web/` and `voice-agent/` dependencies.
+12. **Connect Gmail for email workflows.** With both services running, open [http://localhost:3000](http://localhost:3000), head to *Settings → Gmail*, and complete the Composio OAuth flow. This step is required for email drafting, replies, and the important-email monitor.
 
 The web app proxies API calls to the Python server using the values in `.env`, so keeping both processes running is required for end-to-end flows.
 
