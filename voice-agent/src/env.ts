@@ -16,6 +16,39 @@ function requireEnv(name: string): string {
   return value;
 }
 
+function isDeepgramModel(value: string): boolean {
+  return value.startsWith("deepgram/") || value.startsWith("aura-");
+}
+
+function getSttLanguage(): string {
+  const explicitLanguage = process.env.LIVEKIT_STT_LANGUAGE?.trim();
+  if (explicitLanguage) {
+    return explicitLanguage;
+  }
+
+  const legacyModel = process.env.LIVEKIT_STT_MODEL?.trim();
+  if (!legacyModel) {
+    return "en";
+  }
+
+  const languageMatch = legacyModel.match(/:([a-z]{2}(?:-[A-Z]{2})?)$/);
+  return languageMatch?.[1] || "en";
+}
+
+function getTtsVoice(): string {
+  const explicitVoice = process.env.LIVEKIT_TTS_VOICE?.trim();
+  if (explicitVoice) {
+    return explicitVoice;
+  }
+
+  const legacyModel = process.env.LIVEKIT_TTS_MODEL?.trim();
+  if (!legacyModel || isDeepgramModel(legacyModel)) {
+    return "eve";
+  }
+
+  return legacyModel;
+}
+
 function toWebSocketUrl(value: string): string {
   if (value.startsWith("ws://") || value.startsWith("wss://")) {
     return value;
@@ -34,10 +67,10 @@ export interface VoiceAgentEnv {
   livekitWsUrl: string;
   livekitApiKey: string;
   livekitApiSecret: string;
-  deepgramApiKey: string;
+  xaiApiKey: string;
   openpokeServerUrl: string;
-  livekitSttModel: string;
-  livekitTtsModel: string;
+  livekitSttLanguage: string;
+  livekitTtsVoice: string;
   livekitGreeting: string;
   livekitInstructions: string;
 }
@@ -54,10 +87,10 @@ export function getEnv(): VoiceAgentEnv {
     livekitWsUrl: toWebSocketUrl(requireEnv("LIVEKIT_URL")),
     livekitApiKey: requireEnv("LIVEKIT_API_KEY"),
     livekitApiSecret: requireEnv("LIVEKIT_API_SECRET"),
-    deepgramApiKey: requireEnv("DEEPGRAM_API_KEY"),
+    xaiApiKey: requireEnv("XAI_API_KEY"),
     openpokeServerUrl: process.env.OPENPOKE_SERVER_URL?.trim() || "http://localhost:8001",
-    livekitSttModel: process.env.LIVEKIT_STT_MODEL?.trim() || "deepgram/nova-3:en",
-    livekitTtsModel: process.env.LIVEKIT_TTS_MODEL?.trim() || "aura-2-andromeda-en",
+    livekitSttLanguage: getSttLanguage(),
+    livekitTtsVoice: getTtsVoice(),
     livekitGreeting:
       process.env.LIVEKIT_AGENT_GREETING?.trim() || "Hi, I'm OpenPoke. What can I help you with?",
     livekitInstructions:

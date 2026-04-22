@@ -2,13 +2,20 @@
 
 import json
 from dataclasses import dataclass, field
+from uuid import uuid4
 from typing import Any, Dict, List, Optional, Set
 
 from .agent import build_system_prompt, prepare_message_with_history
 from .tools import ToolResult, get_tool_schemas, handle_tool_call
 from ...config import get_settings
-from ...services.conversation import get_conversation_log, get_working_memory_log
-from ...openrouter_client import request_chat_completion
+from ...services.conversation import (
+    get_conversation_event_hub,
+    get_conversation_log,
+    reset_current_request_id,
+    set_current_request_id,
+    get_working_memory_log,
+)
+from ...openrouter_client import stream_chat_completion
 from ...logging_config import logger
 
 
@@ -54,6 +61,7 @@ class InteractionAgentRuntime:
         self.settings = settings
         self.conversation_log = get_conversation_log()
         self.working_memory_log = get_working_memory_log()
+        self.event_hub = get_conversation_event_hub()
         self.tool_schemas = get_tool_schemas()
 
         if not self.api_key:
@@ -62,9 +70,11 @@ class InteractionAgentRuntime:
             )
 
     # Main entry point for processing user messages through the LLM interaction loop
-    async def execute(self, user_message: str) -> InteractionResult:
+    async def execute(self, user_message: str, request_id: Optional[str] = None) -> InteractionResult:
         """Handle a user-authored message."""
 
+        active_request_id = request_id or uuid4().hex
+        request_token = set_current_request_id(active_request_id)
         try:
             transcript_before = self._load_conversation_transcript()
             self.conversation_log.record_user_message(user_message)
@@ -95,11 +105,17 @@ class InteractionAgentRuntime:
                 response="",
                 error=str(exc),
             )
+        finally:
+            reset_current_request_id(request_token)
 
     # Handle incoming messages from execution agents and generate appropriate responses
-    async def handle_agent_message(self, agent_message: str) -> InteractionResult:
+    async def handle_agent_message(
+        self, agent_message: str, request_id: Optional[str] = None
+    ) -> InteractionResult:
         """Process a status update emitted by an execution agent."""
 
+        active_request_id = request_id or uuid4().hex
+        request_token = set_current_request_id(active_request_id)
         try:
             transcript_before = self._load_conversation_transcript()
             self.conversation_log.record_agent_message(agent_message)
@@ -130,6 +146,8 @@ class InteractionAgentRuntime:
                 response="",
                 error=str(exc),
             )
+        finally:
+            reset_current_request_id(request_token)
 
     # Core interaction loop that handles LLM calls and tool executions until completion
     async def _run_interaction_loop(
@@ -142,8 +160,7 @@ class InteractionAgentRuntime:
         summary = _LoopSummary()
 
         for iteration in range(self.MAX_TOOL_ITERATIONS):
-            response = await self._make_llm_call(system_prompt, messages)
-            assistant_message = self._extract_assistant_message(response)
+            assistant_message = await self._make_llm_call(system_prompt, messages)
 
             assistant_content = (assistant_message.get("content") or "").strip()
             if assistant_content:
@@ -204,29 +221,109 @@ class InteractionAgentRuntime:
         system_prompt: str,
         messages: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Make an LLM call via OpenRouter."""
+        """Make a streaming LLM call via OpenRouter and reconstruct the assistant message."""
 
         logger.debug(
             "Interaction agent calling LLM",
             extra={"model": self.model, "tools": len(self.tool_schemas)},
         )
-        return await request_chat_completion(
+        assistant_content_parts: List[str] = []
+        tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
+        published_reply_id: Optional[str] = None
+        saw_tool_calls = False
+
+        async for chunk in stream_chat_completion(
             model=self.model,
             messages=messages,
             system=system_prompt,
             api_key=self.api_key,
             tools=self.tool_schemas,
-        )
+        ):
+            choice = (chunk.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
 
-    # Extract the assistant's message from the OpenRouter API response structure
-    def _extract_assistant_message(self, response: Dict[str, Any]) -> Dict[str, Any]:
-        """Return the assistant message from the raw response payload."""
+            content_delta = delta.get("content")
+            if isinstance(content_delta, str) and content_delta:
+                assistant_content_parts.append(content_delta)
+                if not saw_tool_calls:
+                    if published_reply_id is None:
+                        published_reply_id = uuid4().hex
+                        self.event_hub.publish(
+                            "assistant_start",
+                            reply_id=published_reply_id,
+                            request_id=get_current_request_id(),
+                        )
+                    self.event_hub.publish(
+                        "assistant_delta",
+                        reply_id=published_reply_id,
+                        request_id=get_current_request_id(),
+                        delta=content_delta,
+                    )
 
-        choice = (response.get("choices") or [{}])[0]
-        message = choice.get("message")
-        if not isinstance(message, dict):
-            raise RuntimeError("LLM response did not include an assistant message")
-        return message
+            streamed_tool_calls = delta.get("tool_calls") or []
+            if not isinstance(streamed_tool_calls, list):
+                continue
+
+            if streamed_tool_calls:
+                saw_tool_calls = True
+                if published_reply_id is not None:
+                    self.event_hub.publish(
+                        "assistant_abort",
+                        reply_id=published_reply_id,
+                        request_id=get_current_request_id(),
+                    )
+                    published_reply_id = None
+
+            for raw_tool_call in streamed_tool_calls:
+                if not isinstance(raw_tool_call, dict):
+                    continue
+
+                index = raw_tool_call.get("index")
+                if not isinstance(index, int):
+                    index = 0
+
+                tool_call = tool_calls_by_index.setdefault(
+                    index,
+                    {
+                        "id": raw_tool_call.get("id"),
+                        "type": raw_tool_call.get("type") or "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+
+                if isinstance(raw_tool_call.get("id"), str):
+                    tool_call["id"] = raw_tool_call["id"]
+                if isinstance(raw_tool_call.get("type"), str):
+                    tool_call["type"] = raw_tool_call["type"]
+
+                function_delta = raw_tool_call.get("function") or {}
+                if not isinstance(function_delta, dict):
+                    continue
+
+                if isinstance(function_delta.get("name"), str):
+                    tool_call["function"]["name"] += function_delta["name"]
+                if isinstance(function_delta.get("arguments"), str):
+                    tool_call["function"]["arguments"] += function_delta["arguments"]
+
+        if published_reply_id is not None:
+            self.event_hub.publish(
+                "assistant_done",
+                reply_id=published_reply_id,
+                request_id=get_current_request_id(),
+            )
+
+        assistant_message: Dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(assistant_content_parts),
+        }
+        if tool_calls_by_index:
+            assistant_message["tool_calls"] = [
+                tool_calls_by_index[index] for index in sorted(tool_calls_by_index.keys())
+            ]
+
+        return assistant_message
 
     # Convert raw LLM tool calls into structured _ToolCall objects with validation
     def _parse_tool_calls(self, raw_tool_calls: List[Dict[str, Any]]) -> List[_ToolCall]:

@@ -69,11 +69,11 @@ OpenPoke is a simplified, open-source take on [Interaction Company’s](https://
    LIVEKIT_API_SECRET=your_livekit_api_secret_here
    LIVEKIT_ROOM_PREFIX=openpoke
    LIVEKIT_AGENT_NAME=openpoke-voice-agent
-   DEEPGRAM_API_KEY=your_deepgram_api_key_here
+   XAI_API_KEY=your_xai_api_key_here
    OPENPOKE_SERVER_URL=http://localhost:8001
-   LIVEKIT_STT_MODEL=deepgram/nova-3:en
+   LIVEKIT_STT_LANGUAGE=en
    LIVEKIT_LLM_MODEL=openai/gpt-4.1-mini
-   LIVEKIT_TTS_MODEL=aura-2-andromeda-en
+   LIVEKIT_TTS_VOICE=eve
    ```
 8. **Install the voice-agent dependencies** if you want Talk mode:
    ```bash

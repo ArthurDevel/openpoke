@@ -40,7 +40,7 @@ async def handle_chat_request(payload: ChatRequest) -> Union[PlainTextResponse, 
 
     async def _run_interaction() -> None:
         try:
-            await runtime.execute(user_message=user_content)
+            await runtime.execute(user_message=user_content, request_id=payload.request_id)
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("chat task failed", extra={"error": str(exc)})
 

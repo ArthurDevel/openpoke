@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
 
@@ -88,4 +88,59 @@ async def request_chat_completion(
     raise OpenRouterError("OpenRouter request failed: unknown error")
 
 
-__all__ = ["OpenRouterError", "request_chat_completion", "OpenRouterBaseURL"]
+async def stream_chat_completion(
+    *,
+    model: str,
+    messages: List[Dict[str, str]],
+    system: Optional[str] = None,
+    api_key: Optional[str] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    base_url: str = OpenRouterBaseURL,
+) -> AsyncIterator[Dict[str, Any]]:
+    payload: Dict[str, object] = {
+        "model": model,
+        "messages": _build_messages(messages, system),
+        "stream": True,
+    }
+    if tools:
+        payload["tools"] = tools
+
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    headers = _headers(api_key=api_key)
+    headers["Accept"] = "text/event-stream"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            async with client.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=payload,
+                timeout=60.0,
+            ) as response:
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    _handle_response_error(exc)
+
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+
+                    data = line[len("data:") :].strip()
+                    if not data or data == "[DONE]":
+                        continue
+
+                    yield json.loads(data)
+        except httpx.HTTPStatusError as exc:  # pragma: no cover - handled above
+            _handle_response_error(exc)
+        except httpx.HTTPError as exc:
+            raise OpenRouterError(f"OpenRouter streaming request failed: {exc}") from exc
+        return
+
+
+__all__ = ["OpenRouterError", "request_chat_completion", "stream_chat_completion", "OpenRouterBaseURL"]

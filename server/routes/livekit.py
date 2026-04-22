@@ -28,7 +28,8 @@ def create_livekit_token(payload: LiveKitTokenRequest) -> LiveKitTokenResponse:
             detail="LiveKit backend support is not installed.",
         ) from exc
 
-    room_name = (payload.room_name or f"{settings.livekit_room_prefix}-talk").strip()
+    default_room_name = f"{settings.livekit_room_prefix}-talk-{uuid4().hex[:8]}"
+    room_name = (payload.room_name or default_room_name).strip()
     if not room_name:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="room_name cannot be empty")
 
