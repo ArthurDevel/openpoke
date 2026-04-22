@@ -52,6 +52,104 @@ class _LoopSummary:
     execution_agents: Set[str] = field(default_factory=set)
 
 
+_STREAMABLE_TOOL_NAME = "send_message_to_user"
+_STREAMABLE_MESSAGE_KEY = '"message"'
+
+
+class _MessageStreamExtractor:
+    """Extract the streaming string value of the `message` field from JSON tool args.
+
+    Feeds accept partial JSON chunks as they arrive on the wire and return any newly
+    available characters of the target string value. Handles backslash escapes and
+    \\uXXXX unicode escapes.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._pos = 0
+        self._state = "SCAN"
+        self._unicode_buf = ""
+        self._done = False
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    def feed(self, chunk: str) -> str:
+        if self._done or not chunk:
+            return ""
+        self._buffer += chunk
+        out: List[str] = []
+
+        while self._pos < len(self._buffer) and not self._done:
+            if self._state == "SCAN":
+                if not self._advance_to_value_start():
+                    break
+                continue
+
+            ch = self._buffer[self._pos]
+            if self._state == "IN_STRING":
+                if ch == "\\":
+                    self._state = "ESCAPE"
+                    self._pos += 1
+                elif ch == '"':
+                    self._done = True
+                    self._pos += 1
+                else:
+                    out.append(ch)
+                    self._pos += 1
+            elif self._state == "ESCAPE":
+                if ch == "u":
+                    self._state = "UNICODE"
+                    self._unicode_buf = ""
+                else:
+                    escape_map = {
+                        '"': '"', "\\": "\\", "/": "/",
+                        "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+                    }
+                    out.append(escape_map.get(ch, ch))
+                    self._state = "IN_STRING"
+                self._pos += 1
+            elif self._state == "UNICODE":
+                self._unicode_buf += ch
+                self._pos += 1
+                if len(self._unicode_buf) == 4:
+                    try:
+                        out.append(chr(int(self._unicode_buf, 16)))
+                    except ValueError:
+                        pass
+                    self._unicode_buf = ""
+                    self._state = "IN_STRING"
+            else:
+                break
+
+        return "".join(out)
+
+    def _advance_to_value_start(self) -> bool:
+        idx = self._buffer.find(_STREAMABLE_MESSAGE_KEY, self._pos)
+        if idx == -1:
+            return False
+        j = idx + len(_STREAMABLE_MESSAGE_KEY)
+        while j < len(self._buffer) and self._buffer[j] in " \t\n\r":
+            j += 1
+        if j >= len(self._buffer):
+            return False
+        if self._buffer[j] != ":":
+            self._pos = j
+            return True
+        j += 1
+        while j < len(self._buffer) and self._buffer[j] in " \t\n\r":
+            j += 1
+        if j >= len(self._buffer):
+            return False
+        if self._buffer[j] != '"':
+            self._pos = j
+            return True
+        self._pos = j + 1
+        self._state = "IN_STRING"
+        return True
+
+
 class InteractionAgentRuntime:
     """Manages the interaction agent's request processing."""
 
@@ -67,11 +165,22 @@ class InteractionAgentRuntime:
         self.working_memory_log = get_working_memory_log()
         self.event_hub = get_conversation_event_hub()
         self.tool_schemas = get_tool_schemas()
+        self._t0: float = 0.0
+        self._timings: List[Dict[str, Any]] = []
+        self._iteration: int = 0
 
         if not self.api_key:
             raise ValueError(
                 "OpenRouter API key not configured. Set OPENROUTER_API_KEY environment variable."
             )
+
+    def _stamp(self, event: str, **kwargs: Any) -> int:
+        """Record a timing event with ms since _t0. Returns the recorded dt_ms."""
+        dt_ms = int((time.perf_counter() - self._t0) * 1000)
+        entry: Dict[str, Any] = {"event": event, "dt_ms": dt_ms}
+        entry.update(kwargs)
+        self._timings.append(entry)
+        return dt_ms
 
     # Main entry point for processing user messages through the LLM interaction loop
     async def execute(self, user_message: str, request_id: Optional[str] = None) -> InteractionResult:
@@ -79,7 +188,10 @@ class InteractionAgentRuntime:
 
         active_request_id = request_id or uuid4().hex
         request_token = set_current_request_id(active_request_id)
-        t0 = time.perf_counter()
+        self._t0 = time.perf_counter()
+        self._timings = []
+        self._iteration = 0
+        self._stamp("execute_started", request_id=active_request_id)
         logger.info(
             "trace stage=execute_started request_id=%s dt_ms=0", active_request_id
         )
@@ -116,16 +228,18 @@ class InteractionAgentRuntime:
                 error=str(exc),
             )
         finally:
+            total_ms = self._stamp("execute_done")
             self._dump_transcript(
                 request_id=active_request_id,
                 trigger="user",
                 system_prompt=system_prompt,
                 messages=messages,
+                user_input=user_message,
             )
             logger.info(
                 "trace stage=execute_done request_id=%s dt_ms=%d",
                 active_request_id,
-                int((time.perf_counter() - t0) * 1000),
+                total_ms,
             )
             reset_current_request_id(request_token)
 
@@ -137,6 +251,10 @@ class InteractionAgentRuntime:
 
         active_request_id = request_id or uuid4().hex
         request_token = set_current_request_id(active_request_id)
+        self._t0 = time.perf_counter()
+        self._timings = []
+        self._iteration = 0
+        self._stamp("execute_started", request_id=active_request_id, trigger="agent")
         system_prompt: str = ""
         messages: List[Dict[str, Any]] = []
         try:
@@ -170,11 +288,13 @@ class InteractionAgentRuntime:
                 error=str(exc),
             )
         finally:
+            self._stamp("execute_done")
             self._dump_transcript(
                 request_id=active_request_id,
                 trigger="agent",
                 system_prompt=system_prompt,
                 messages=messages,
+                user_input=agent_message,
             )
             reset_current_request_id(request_token)
 
@@ -189,7 +309,10 @@ class InteractionAgentRuntime:
         summary = _LoopSummary()
 
         for iteration in range(self.MAX_TOOL_ITERATIONS):
+            self._iteration = iteration + 1
+            self._stamp("iter_start", iter=self._iteration)
             assistant_message = await self._make_llm_call(system_prompt, messages)
+            self._stamp("iter_llm_end", iter=self._iteration)
 
             assistant_content = (assistant_message.get("content") or "").strip()
             if assistant_content:
@@ -217,7 +340,14 @@ class InteractionAgentRuntime:
                     if isinstance(agent_name, str) and agent_name:
                         summary.execution_agents.add(agent_name)
 
+                self._stamp("tool_start", iter=self._iteration, tool=tool_call.name)
                 result = self._execute_tool(tool_call)
+                self._stamp(
+                    "tool_end",
+                    iter=self._iteration,
+                    tool=tool_call.name,
+                    success=result.success,
+                )
 
                 if result.user_message:
                     summary.user_messages.append(result.user_message)
@@ -260,7 +390,37 @@ class InteractionAgentRuntime:
         tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
         published_reply_id: Optional[str] = None
         saw_tool_calls = False
+        tool_stream_state: Dict[int, Dict[str, Any]] = {}
+        saw_first_chunk = False
 
+        def _publish_tool_delta(state: Dict[str, Any], text: str) -> None:
+            if not text:
+                return
+            if not state.get("first_char_stamped"):
+                state["first_char_stamped"] = True
+                self._stamp(
+                    "tool_first_streamed_char",
+                    iter=self._iteration,
+                    tool=_STREAMABLE_TOOL_NAME,
+                )
+            self.event_hub.publish(
+                "assistant_delta",
+                reply_id=state["reply_id"],
+                request_id=get_current_request_id(),
+                delta=text,
+            )
+
+        def _close_tool_stream(state: Dict[str, Any]) -> None:
+            if state.get("closed"):
+                return
+            state["closed"] = True
+            self.event_hub.publish(
+                "assistant_done",
+                reply_id=state["reply_id"],
+                request_id=get_current_request_id(),
+            )
+
+        self._stamp("iter_llm_start", iter=self._iteration)
         async for chunk in stream_chat_completion(
             model=self.model,
             messages=messages,
@@ -268,6 +428,9 @@ class InteractionAgentRuntime:
             api_key=self.api_key,
             tools=self.tool_schemas,
         ):
+            if not saw_first_chunk:
+                saw_first_chunk = True
+                self._stamp("iter_first_chunk", iter=self._iteration)
             choice = (chunk.get("choices") or [{}])[0]
             delta = choice.get("delta") or {}
             if not isinstance(delta, dict):
@@ -279,6 +442,9 @@ class InteractionAgentRuntime:
                 if not saw_tool_calls:
                     if published_reply_id is None:
                         published_reply_id = uuid4().hex
+                        self._stamp(
+                            "content_first_streamed_char", iter=self._iteration
+                        )
                         self.event_hub.publish(
                             "assistant_start",
                             reply_id=published_reply_id,
@@ -331,10 +497,42 @@ class InteractionAgentRuntime:
                 if not isinstance(function_delta, dict):
                     continue
 
-                if isinstance(function_delta.get("name"), str):
-                    tool_call["function"]["name"] += function_delta["name"]
-                if isinstance(function_delta.get("arguments"), str):
-                    tool_call["function"]["arguments"] += function_delta["arguments"]
+                name_delta = function_delta.get("name")
+                if isinstance(name_delta, str) and name_delta:
+                    tool_call["function"]["name"] += name_delta
+
+                state = tool_stream_state.setdefault(
+                    index,
+                    {"enabled": False, "closed": False, "reply_id": None, "extractor": None},
+                )
+
+                current_name = tool_call["function"]["name"]
+                if (
+                    not state["enabled"]
+                    and not state["closed"]
+                    and current_name == _STREAMABLE_TOOL_NAME
+                ):
+                    state["enabled"] = True
+                    state["reply_id"] = uuid4().hex
+                    state["extractor"] = _MessageStreamExtractor()
+                    self.event_hub.publish(
+                        "assistant_start",
+                        reply_id=state["reply_id"],
+                        request_id=get_current_request_id(),
+                    )
+                    existing_args = tool_call["function"]["arguments"]
+                    if existing_args:
+                        _publish_tool_delta(state, state["extractor"].feed(existing_args))
+                        if state["extractor"].done:
+                            _close_tool_stream(state)
+
+                arguments_delta = function_delta.get("arguments")
+                if isinstance(arguments_delta, str) and arguments_delta:
+                    tool_call["function"]["arguments"] += arguments_delta
+                    if state["enabled"] and not state["closed"]:
+                        _publish_tool_delta(state, state["extractor"].feed(arguments_delta))
+                        if state["extractor"].done:
+                            _close_tool_stream(state)
 
         if published_reply_id is not None:
             self.event_hub.publish(
@@ -342,6 +540,10 @@ class InteractionAgentRuntime:
                 reply_id=published_reply_id,
                 request_id=get_current_request_id(),
             )
+
+        for state in tool_stream_state.values():
+            if state.get("enabled") and not state.get("closed"):
+                _close_tool_stream(state)
 
         assistant_message: Dict[str, Any] = {
             "role": "assistant",
@@ -530,6 +732,8 @@ class InteractionAgentRuntime:
         return summary.last_assistant_text
 
     TRANSCRIPT_DIR = Path(__file__).resolve().parents[2] / "data" / "llm_transcripts"
+    SESSION_FILE = TRANSCRIPT_DIR / "session.md"
+    SYSTEM_PROMPT_FILE = TRANSCRIPT_DIR / "system_prompt.md"
 
     def _dump_transcript(
         self,
@@ -538,43 +742,76 @@ class InteractionAgentRuntime:
         trigger: str,
         system_prompt: str,
         messages: List[Dict[str, Any]],
+        user_input: str,
     ) -> None:
-        """Write the full LLM chat (system, user/agent, assistant, tool) to markdown."""
+        """Append this turn's transcript (timings + messages) to the session file."""
 
         if not messages and not system_prompt:
             return
 
         try:
             self.TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-            now = datetime.now(timezone.utc)
-            filename = f"{now.strftime('%Y%m%dT%H%M%SZ')}_{request_id}.md"
-            path = self.TRANSCRIPT_DIR / filename
 
+            if system_prompt:
+                existing = (
+                    self.SYSTEM_PROMPT_FILE.read_text(encoding="utf-8")
+                    if self.SYSTEM_PROMPT_FILE.exists()
+                    else ""
+                )
+                if existing != system_prompt:
+                    self.SYSTEM_PROMPT_FILE.write_text(system_prompt, encoding="utf-8")
+
+            now = datetime.now(timezone.utc)
+            preview = user_input.strip().splitlines()[0][:80] if user_input else ""
             lines: List[str] = [
-                f"# LLM transcript — {request_id}",
+                "",
+                "---",
+                "",
+                f"## Turn — {now.isoformat()} — request_id=`{request_id}`",
                 "",
                 f"- trigger: `{trigger}`",
                 f"- model: `{self.model}`",
-                f"- timestamp: `{now.isoformat()}`",
+                f"- iterations: {self._iteration}",
                 f"- message count: {len(messages)}",
-                "",
-                "## System prompt",
-                "",
-                "```",
-                system_prompt or "(empty)",
-                "```",
-                "",
-                "## Conversation",
-                "",
             ]
-
+            if preview:
+                lines.append(f"- input: {preview!r}")
+            lines.extend(["", "### Timings (dt_ms from execute_started)", ""])
+            lines.extend(self._render_timings_md())
+            lines.extend(["", "### Messages", ""])
             for idx, msg in enumerate(messages):
                 lines.extend(self._render_message_md(idx, msg))
 
-            path.write_text("\n".join(lines), encoding="utf-8")
-            logger.info("LLM transcript written to %s", path)
+            header_needed = not self.SESSION_FILE.exists()
+            with self.SESSION_FILE.open("a", encoding="utf-8") as fh:
+                if header_needed:
+                    fh.write(
+                        "# Interaction agent session log\n\n"
+                        f"System prompt: see `{self.SYSTEM_PROMPT_FILE.name}` (overwritten when it changes).\n"
+                    )
+                fh.write("\n".join(lines))
+                fh.write("\n")
+            logger.info("LLM transcript appended to %s", self.SESSION_FILE)
         except Exception as exc:  # pragma: no cover - best-effort telemetry
             logger.warning("failed to dump LLM transcript: %s", exc)
+
+    def _render_timings_md(self) -> List[str]:
+        """Render the timings list as a markdown table."""
+        if not self._timings:
+            return ["_no timings recorded_"]
+
+        lines = ["| dt_ms | event | detail |", "|-------|-------|--------|"]
+        for t in self._timings:
+            dt = t.get("dt_ms", "")
+            event = t.get("event", "")
+            detail_parts = [
+                f"{k}=`{v}`"
+                for k, v in t.items()
+                if k not in {"event", "dt_ms"}
+            ]
+            detail = ", ".join(detail_parts) if detail_parts else ""
+            lines.append(f"| {dt} | `{event}` | {detail} |")
+        return lines
 
     def _render_message_md(self, idx: int, msg: Dict[str, Any]) -> List[str]:
         """Render a single chat message as markdown."""

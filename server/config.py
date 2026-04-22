@@ -51,7 +51,7 @@ class Settings(BaseModel):
     server_port: int = Field(default=_env_int("OPENPOKE_PORT", 8001))
 
     # LLM model selection
-    interaction_agent_model: str = Field(default="anthropic/claude-sonnet-4")
+    interaction_agent_model: str = Field(default="google/gemini-3-flash-preview")
     execution_agent_model: str = Field(default="anthropic/claude-sonnet-4")
     execution_agent_search_model: str = Field(default="anthropic/claude-sonnet-4")
     summarizer_model: str = Field(default="anthropic/claude-sonnet-4")
