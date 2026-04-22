@@ -8,6 +8,7 @@ FRONTEND_PID=""
 VOICE_AGENT_PID=""
 CLEANUP_DONE=0
 CURRENT_SCRIPT_PID="$$"
+SESSION_LAUNCHER_PYTHON="$(command -v python3 2>/dev/null || true)"
 
 cleanup() {
   [[ "${CLEANUP_DONE}" -eq 1 ]] && return
@@ -15,9 +16,9 @@ cleanup() {
 
   trap - INT TERM EXIT
 
-  hard_stop_tree "${BACKEND_PID}"
-  hard_stop_tree "${FRONTEND_PID}"
-  hard_stop_tree "${VOICE_AGENT_PID}"
+  hard_stop_group "${BACKEND_PID}"
+  hard_stop_group "${FRONTEND_PID}"
+  hard_stop_group "${VOICE_AGENT_PID}"
   hard_stop_repo_processes "${ROOT_DIR}/web/node_modules/.bin/next dev"
   hard_stop_repo_processes "${ROOT_DIR}/voice-agent/node_modules/.bin/tsx src/agent.ts dev"
   hard_stop_repo_processes "${ROOT_DIR}/voice-agent/node_modules/@livekit/agents/dist/ipc/job_proc_lazy_main.js"
@@ -41,8 +42,8 @@ kill_tree() {
   local signal="$2"
   local child=""
 
-  [[ -z "${pid}" ]] && return
-  kill -0 "${pid}" 2>/dev/null || return
+  [[ -z "${pid}" ]] && return 0
+  kill -0 "${pid}" 2>/dev/null || return 0
 
   for child in $(pgrep -P "${pid}" 2>/dev/null || true); do
     kill_tree "${child}" "${signal}"
@@ -54,49 +55,85 @@ kill_tree() {
 stop_tree() {
   local pid="$1"
 
-  [[ -z "${pid}" ]] && return
-  kill -0 "${pid}" 2>/dev/null || return
+  [[ -z "${pid}" ]] && return 0
+  kill -0 "${pid}" 2>/dev/null || return 0
 
   kill_tree "${pid}" INT
   sleep 1
 
-  kill -0 "${pid}" 2>/dev/null || return
+  kill -0 "${pid}" 2>/dev/null || return 0
   kill_tree "${pid}" TERM
   sleep 2
 
-  kill -0 "${pid}" 2>/dev/null || return
+  kill -0 "${pid}" 2>/dev/null || return 0
   kill_tree "${pid}" KILL
 }
 
 hard_stop_tree() {
   local pid="$1"
 
-  [[ -z "${pid}" ]] && return
-  kill -0 "${pid}" 2>/dev/null || return
+  [[ -z "${pid}" ]] && return 0
+  kill -0 "${pid}" 2>/dev/null || return 0
   kill_tree "${pid}" KILL
+}
+
+signal_target() {
+  local pid="$1"
+  local signal="$2"
+  local pgid=""
+
+  [[ -z "${pid}" ]] && return 0
+  kill -0 "${pid}" 2>/dev/null || return 0
+
+  pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')"
+  if [[ -n "${pgid}" && "${pgid}" == "${pid}" ]]; then
+    kill -"${signal}" -- "-${pgid}" 2>/dev/null || true
+    return 0
+  fi
+
+  kill_tree "${pid}" "${signal}"
+}
+
+stop_group() {
+  local pid="$1"
+
+  [[ -z "${pid}" ]] && return 0
+  kill -0 "${pid}" 2>/dev/null || return 0
+
+  signal_target "${pid}" INT
+  sleep 1
+
+  kill -0 "${pid}" 2>/dev/null || return 0
+  signal_target "${pid}" TERM
+  sleep 2
+
+  kill -0 "${pid}" 2>/dev/null || return 0
+  signal_target "${pid}" KILL
+}
+
+hard_stop_group() {
+  local pid="$1"
+
+  [[ -z "${pid}" ]] && return 0
+  kill -0 "${pid}" 2>/dev/null || return 0
+  signal_target "${pid}" KILL
 }
 
 start_group() {
   local cmd="$1"
 
-  bash -lc "${cmd}" &
+  "${SESSION_LAUNCHER_PYTHON}" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' bash -lc "${cmd}" &
   REPLY=$!
 }
 
 stop_repo_processes() {
   local pattern="$1"
   local pid=""
-  local pgid=""
 
   for pid in $(pgrep -f "${pattern}" 2>/dev/null || true); do
     [[ "${pid}" == "${CURRENT_SCRIPT_PID}" ]] && continue
     kill -0 "${pid}" 2>/dev/null || continue
-    pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')"
-    if [[ -n "${pgid}" ]]; then
-      kill -TERM -- "-${pgid}" 2>/dev/null || true
-    else
-      kill -TERM "${pid}" 2>/dev/null || true
-    fi
+    signal_target "${pid}" TERM
   done
 
   sleep 1
@@ -104,28 +141,18 @@ stop_repo_processes() {
   for pid in $(pgrep -f "${pattern}" 2>/dev/null || true); do
     [[ "${pid}" == "${CURRENT_SCRIPT_PID}" ]] && continue
     kill -0 "${pid}" 2>/dev/null || continue
-    pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')"
-    if [[ -n "${pgid}" ]]; then
-      kill -KILL -- "-${pgid}" 2>/dev/null || true
-    else
-      kill -KILL "${pid}" 2>/dev/null || true
-    fi
+    signal_target "${pid}" KILL
   done
 }
 
 hard_stop_repo_processes() {
   local pattern="$1"
   local pid=""
-  local pgid=""
 
   for pid in $(pgrep -f "${pattern}" 2>/dev/null || true); do
     [[ "${pid}" == "${CURRENT_SCRIPT_PID}" ]] && continue
     kill -0 "${pid}" 2>/dev/null || continue
-    pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')"
-    if [[ -n "${pgid}" ]]; then
-      kill -KILL -- "-${pgid}" 2>/dev/null || true
-    fi
-    kill -KILL "${pid}" 2>/dev/null || true
+    signal_target "${pid}" KILL
   done
 }
 
@@ -139,17 +166,7 @@ assert_port_available() {
 
   command="$(ps -o command= -p "${pid}" 2>/dev/null || true)"
   if [[ "${command}" == *"${ROOT_DIR}"* ]]; then
-    local pgid=""
-    pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')"
-    if [[ -n "${pgid}" ]]; then
-      kill -TERM -- "-${pgid}" 2>/dev/null || true
-      sleep 1
-      kill -0 "${pid}" 2>/dev/null && kill -KILL -- "-${pgid}" 2>/dev/null || true
-    else
-      kill -TERM "${pid}" 2>/dev/null || true
-      sleep 1
-      kill -0 "${pid}" 2>/dev/null && kill -KILL "${pid}" 2>/dev/null || true
-    fi
+    stop_group "${pid}"
     return
   fi
 
@@ -174,6 +191,11 @@ assert_port_available 8001
 if [[ ! -x ".venv/bin/python" ]]; then
   echo "Missing .venv/bin/python. Create the virtualenv first." >&2
   echo "Example: ~/.pyenv/versions/3.10.0/bin/python -m venv .venv" >&2
+  exit 1
+fi
+
+if [[ -z "${SESSION_LAUNCHER_PYTHON}" ]]; then
+  echo "Missing python3. Install it before running start-dev.sh." >&2
   exit 1
 fi
 
@@ -238,3 +260,5 @@ while true; do
 
   sleep 1
 done
+
+cleanup
