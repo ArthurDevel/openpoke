@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Optional, Union
 
 from fastapi import status
@@ -22,6 +23,9 @@ def _extract_latest_user_message(payload: ChatRequest) -> Optional[ChatMessage]:
 async def handle_chat_request(payload: ChatRequest) -> Union[PlainTextResponse, JSONResponse]:
     """Handle a chat request using the InteractionAgentRuntime."""
 
+    t0 = time.perf_counter()
+    request_id = payload.request_id or "-"
+
     # Extract user message
     user_message = _extract_latest_user_message(payload)
     if user_message is None:
@@ -29,7 +33,11 @@ async def handle_chat_request(payload: ChatRequest) -> Union[PlainTextResponse, 
 
     user_content = user_message.content.strip()  # Already checked in _extract_latest_user_message
 
-    logger.info("chat request", extra={"message_length": len(user_content)})
+    logger.info(
+        "trace stage=chat_received request_id=%s dt_ms=0 msg_len=%d",
+        request_id,
+        len(user_content),
+    )
 
     try:
         runtime = InteractionAgentRuntime()
@@ -42,8 +50,13 @@ async def handle_chat_request(payload: ChatRequest) -> Union[PlainTextResponse, 
         try:
             await runtime.execute(user_message=user_content, request_id=payload.request_id)
         except Exception as exc:  # pragma: no cover - defensive
-            logger.error("chat task failed", extra={"error": str(exc)})
+            logger.exception("chat task failed: %s", exc)
 
     asyncio.create_task(_run_interaction())
 
+    logger.info(
+        "trace stage=chat_accepted request_id=%s dt_ms=%d",
+        request_id,
+        int((time.perf_counter() - t0) * 1000),
+    )
     return PlainTextResponse("", status_code=status.HTTP_202_ACCEPTED)

@@ -33,6 +33,16 @@ async function entry(ctx) {
     let pendingUserTurn = false;
     let currentRequestId = null;
     const streamedRequestIds = new Set();
+    const requestStartTimes = new Map();
+    const loggedFirstAssistantStart = new Set();
+    const loggedFirstAssistantDelta = new Set();
+    const loggedTtsSayQueued = new Set();
+    const traceStage = (stage, requestId, extra) => {
+        const id = requestId ?? "-";
+        const start = requestId ? requestStartTimes.get(requestId) : undefined;
+        const dtMs = start !== undefined ? Math.round(performance.now() - start) : 0;
+        console.info(`[openpoke-voice-agent] trace stage=${stage} request_id=${id} dt_ms=${dtMs}`, extra ?? {});
+    };
     class TransportAgent extends voice.Agent {
         async onUserTurnCompleted(_chatCtx, newMessage) {
             const transcript = newMessage.textContent?.trim();
@@ -42,9 +52,13 @@ async function entry(ctx) {
             }
             const requestId = randomUUID();
             currentRequestId = requestId;
+            requestStartTimes.set(requestId, performance.now());
             pendingUserTurn = false;
+            traceStage("user_turn_completed", requestId, { transcriptLength: transcript.length });
             console.info("[openpoke-voice-agent] completed user turn", { transcript });
+            traceStage("chat_send_start", requestId);
             await sendChatMessage(env, transcript, requestId);
+            traceStage("chat_send_returned", requestId);
         }
     }
     const agent = new TransportAgent({
@@ -112,6 +126,10 @@ async function entry(ctx) {
             },
         });
         activeReplyId = replyId;
+        if (currentRequestId && !loggedTtsSayQueued.has(currentRequestId)) {
+            loggedTtsSayQueued.add(currentRequestId);
+            traceStage("tts_say_queued", currentRequestId, { replyId });
+        }
         const handle = session.say(asTextStream(textStream), {
             allowInterruptions: true,
             addToChatCtx: false,
@@ -180,6 +198,10 @@ async function entry(ctx) {
             return;
         }
         if (event === "assistant_start" && replyId) {
+            if (requestId && !loggedFirstAssistantStart.has(requestId)) {
+                loggedFirstAssistantStart.add(requestId);
+                traceStage("first_assistant_start", requestId, { replyId });
+            }
             if (!userSpeaking) {
                 startAssistantReply(replyId);
             }
@@ -188,6 +210,10 @@ async function entry(ctx) {
         if (event === "assistant_delta" && replyId) {
             if (requestId) {
                 streamedRequestIds.add(requestId);
+                if (!loggedFirstAssistantDelta.has(requestId)) {
+                    loggedFirstAssistantDelta.add(requestId);
+                    traceStage("first_assistant_delta", requestId, { replyId });
+                }
             }
             if (activeReplyId !== replyId || !activeReplyController) {
                 startAssistantReply(replyId);
