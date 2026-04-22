@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from ...logging_config import logger
-from ...services.conversation import get_conversation_log
+from ...services.conversation import get_conversation_log, get_current_request_id
 from ...services.execution import get_agent_roster, get_execution_agent_logs
 from ..execution_agent.batch_manager import ExecutionBatchManager
 
@@ -126,7 +126,11 @@ def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
 
     async def _execute_async() -> None:
         try:
-            result = await _EXECUTION_BATCH_MANAGER.execute_agent(agent_name, instructions)
+            result = await _EXECUTION_BATCH_MANAGER.execute_agent(
+                agent_name,
+                instructions,
+                request_id=get_current_request_id(),
+            )
             status = "SUCCESS" if result.success else "FAILED"
             logger.info(f"Agent '{agent_name}' completed: {status}")
         except Exception as exc:  # pragma: no cover - defensive
