@@ -52,6 +52,20 @@ async function entry(ctx: JobContext): Promise<void> {
   let pendingUserTurn = false;
   let currentRequestId: string | null = null;
   const streamedRequestIds = new Set<string>();
+  const requestStartTimes = new Map<string, number>();
+  const loggedFirstAssistantStart = new Set<string>();
+  const loggedFirstAssistantDelta = new Set<string>();
+  const loggedTtsSayQueued = new Set<string>();
+
+  const traceStage = (stage: string, requestId: string | null, extra?: Record<string, unknown>): void => {
+    const id = requestId ?? "-";
+    const start = requestId ? requestStartTimes.get(requestId) : undefined;
+    const dtMs = start !== undefined ? Math.round(performance.now() - start) : 0;
+    console.info(
+      `[openpoke-voice-agent] trace stage=${stage} request_id=${id} dt_ms=${dtMs}`,
+      extra ?? {}
+    );
+  };
 
   class TransportAgent extends voice.Agent {
     override async onUserTurnCompleted(_chatCtx: any, newMessage: any): Promise<void> {
@@ -63,9 +77,13 @@ async function entry(ctx: JobContext): Promise<void> {
 
       const requestId = randomUUID();
       currentRequestId = requestId;
+      requestStartTimes.set(requestId, performance.now());
       pendingUserTurn = false;
+      traceStage("user_turn_completed", requestId, { transcriptLength: transcript.length });
       console.info("[openpoke-voice-agent] completed user turn", { transcript });
+      traceStage("chat_send_start", requestId);
       await sendChatMessage(env, transcript, requestId);
+      traceStage("chat_send_returned", requestId);
     }
   }
 
@@ -141,6 +159,10 @@ async function entry(ctx: JobContext): Promise<void> {
     });
 
     activeReplyId = replyId;
+    if (currentRequestId && !loggedTtsSayQueued.has(currentRequestId)) {
+      loggedTtsSayQueued.add(currentRequestId);
+      traceStage("tts_say_queued", currentRequestId, { replyId });
+    }
     const handle = session.say(asTextStream(textStream), {
       allowInterruptions: true,
       addToChatCtx: false,
@@ -221,6 +243,10 @@ async function entry(ctx: JobContext): Promise<void> {
       }
 
       if (event === "assistant_start" && replyId) {
+        if (requestId && !loggedFirstAssistantStart.has(requestId)) {
+          loggedFirstAssistantStart.add(requestId);
+          traceStage("first_assistant_start", requestId, { replyId });
+        }
         if (!userSpeaking) {
           startAssistantReply(replyId);
         }
@@ -230,6 +256,10 @@ async function entry(ctx: JobContext): Promise<void> {
       if (event === "assistant_delta" && replyId) {
         if (requestId) {
           streamedRequestIds.add(requestId);
+          if (!loggedFirstAssistantDelta.has(requestId)) {
+            loggedFirstAssistantDelta.add(requestId);
+            traceStage("first_assistant_delta", requestId, { replyId });
+          }
         }
         if (activeReplyId !== replyId || !activeReplyController) {
           startAssistantReply(replyId);

@@ -1,7 +1,10 @@
 """Interaction Agent Runtime - handles LLM calls for user and agent turns."""
 
 import json
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 from typing import Any, Dict, List, Optional, Set
 
@@ -11,6 +14,7 @@ from ...config import get_settings
 from ...services.conversation import (
     get_conversation_event_hub,
     get_conversation_log,
+    get_current_request_id,
     reset_current_request_id,
     set_current_request_id,
     get_working_memory_log,
@@ -75,6 +79,12 @@ class InteractionAgentRuntime:
 
         active_request_id = request_id or uuid4().hex
         request_token = set_current_request_id(active_request_id)
+        t0 = time.perf_counter()
+        logger.info(
+            "trace stage=execute_started request_id=%s dt_ms=0", active_request_id
+        )
+        system_prompt: str = ""
+        messages: List[Dict[str, Any]] = []
         try:
             transcript_before = self._load_conversation_transcript()
             self.conversation_log.record_user_message(user_message)
@@ -99,13 +109,24 @@ class InteractionAgentRuntime:
             )
 
         except Exception as exc:
-            logger.error("Interaction agent failed", extra={"error": str(exc)})
+            logger.exception("Interaction agent failed: %s", exc)
             return InteractionResult(
                 success=False,
                 response="",
                 error=str(exc),
             )
         finally:
+            self._dump_transcript(
+                request_id=active_request_id,
+                trigger="user",
+                system_prompt=system_prompt,
+                messages=messages,
+            )
+            logger.info(
+                "trace stage=execute_done request_id=%s dt_ms=%d",
+                active_request_id,
+                int((time.perf_counter() - t0) * 1000),
+            )
             reset_current_request_id(request_token)
 
     # Handle incoming messages from execution agents and generate appropriate responses
@@ -116,6 +137,8 @@ class InteractionAgentRuntime:
 
         active_request_id = request_id or uuid4().hex
         request_token = set_current_request_id(active_request_id)
+        system_prompt: str = ""
+        messages: List[Dict[str, Any]] = []
         try:
             transcript_before = self._load_conversation_transcript()
             self.conversation_log.record_agent_message(agent_message)
@@ -140,13 +163,19 @@ class InteractionAgentRuntime:
             )
 
         except Exception as exc:
-            logger.error("Interaction agent (agent message) failed", extra={"error": str(exc)})
+            logger.exception("Interaction agent (agent message) failed: %s", exc)
             return InteractionResult(
                 success=False,
                 response="",
                 error=str(exc),
             )
         finally:
+            self._dump_transcript(
+                request_id=active_request_id,
+                trigger="agent",
+                system_prompt=system_prompt,
+                messages=messages,
+            )
             reset_current_request_id(request_token)
 
     # Core interaction loop that handles LLM calls and tool executions until completion
@@ -499,3 +528,89 @@ class InteractionAgentRuntime:
             return summary.user_messages[-1]
 
         return summary.last_assistant_text
+
+    TRANSCRIPT_DIR = Path(__file__).resolve().parents[2] / "data" / "llm_transcripts"
+
+    def _dump_transcript(
+        self,
+        *,
+        request_id: str,
+        trigger: str,
+        system_prompt: str,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        """Write the full LLM chat (system, user/agent, assistant, tool) to markdown."""
+
+        if not messages and not system_prompt:
+            return
+
+        try:
+            self.TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+            now = datetime.now(timezone.utc)
+            filename = f"{now.strftime('%Y%m%dT%H%M%SZ')}_{request_id}.md"
+            path = self.TRANSCRIPT_DIR / filename
+
+            lines: List[str] = [
+                f"# LLM transcript — {request_id}",
+                "",
+                f"- trigger: `{trigger}`",
+                f"- model: `{self.model}`",
+                f"- timestamp: `{now.isoformat()}`",
+                f"- message count: {len(messages)}",
+                "",
+                "## System prompt",
+                "",
+                "```",
+                system_prompt or "(empty)",
+                "```",
+                "",
+                "## Conversation",
+                "",
+            ]
+
+            for idx, msg in enumerate(messages):
+                lines.extend(self._render_message_md(idx, msg))
+
+            path.write_text("\n".join(lines), encoding="utf-8")
+            logger.info("LLM transcript written to %s", path)
+        except Exception as exc:  # pragma: no cover - best-effort telemetry
+            logger.warning("failed to dump LLM transcript: %s", exc)
+
+    def _render_message_md(self, idx: int, msg: Dict[str, Any]) -> List[str]:
+        """Render a single chat message as markdown."""
+
+        role = str(msg.get("role", "unknown"))
+        lines: List[str] = [f"### [{idx}] {role}", ""]
+
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            lines.extend(["```", content, "```", ""])
+        elif content:
+            lines.extend(["```json", self._safe_json_dump(content), "```", ""])
+
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            lines.append("**tool_calls:**")
+            lines.append("")
+            for tc in tool_calls:
+                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                name = fn.get("name", "?")
+                args_raw = fn.get("arguments", "")
+                if isinstance(args_raw, str):
+                    try:
+                        args_pretty = json.dumps(json.loads(args_raw), indent=2)
+                    except Exception:
+                        args_pretty = args_raw
+                else:
+                    args_pretty = self._safe_json_dump(args_raw)
+                call_id = tc.get("id") if isinstance(tc, dict) else None
+                lines.append(f"- `{name}` (id=`{call_id}`)")
+                lines.extend(["  ```json", args_pretty, "  ```"])
+            lines.append("")
+
+        tool_call_id = msg.get("tool_call_id")
+        if tool_call_id:
+            lines.append(f"*tool_call_id:* `{tool_call_id}`")
+            lines.append("")
+
+        return lines
