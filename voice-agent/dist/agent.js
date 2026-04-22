@@ -32,11 +32,23 @@ async function entry(ctx) {
     });
     let pendingUserTurn = false;
     let currentRequestId = null;
-    const streamedRequestIds = new Set();
+    const streamedReplyTextByReplyId = new Map();
+    const streamedReplyRequestByReplyId = new Map();
+    const completedStreamedRepliesByRequestId = new Map();
     const requestStartTimes = new Map();
     const loggedFirstAssistantStart = new Set();
     const loggedFirstAssistantDelta = new Set();
     const loggedTtsSayQueued = new Set();
+    const normalizeReplyText = (value) => value.trim().replace(/\s+/g, " ");
+    const rememberStreamedReply = (requestId, content) => {
+        const normalized = normalizeReplyText(content);
+        if (!normalized) {
+            return;
+        }
+        const existing = completedStreamedRepliesByRequestId.get(requestId) ?? new Set();
+        existing.add(normalized);
+        completedStreamedRepliesByRequestId.set(requestId, existing);
+    };
     const traceStage = (stage, requestId, extra) => {
         const id = requestId ?? "-";
         const start = requestId ? requestStartTimes.get(requestId) : undefined;
@@ -51,6 +63,9 @@ async function entry(ctx) {
                 return;
             }
             const requestId = randomUUID();
+            if (currentRequestId) {
+                completedStreamedRepliesByRequestId.delete(currentRequestId);
+            }
             currentRequestId = requestId;
             requestStartTimes.set(requestId, performance.now());
             pendingUserTurn = false;
@@ -198,6 +213,10 @@ async function entry(ctx) {
             return;
         }
         if (event === "assistant_start" && replyId) {
+            streamedReplyTextByReplyId.set(replyId, "");
+            if (requestId) {
+                streamedReplyRequestByReplyId.set(replyId, requestId);
+            }
             if (requestId && !loggedFirstAssistantStart.has(requestId)) {
                 loggedFirstAssistantStart.add(requestId);
                 traceStage("first_assistant_start", requestId, { replyId });
@@ -208,12 +227,9 @@ async function entry(ctx) {
             return;
         }
         if (event === "assistant_delta" && replyId) {
-            if (requestId) {
-                streamedRequestIds.add(requestId);
-                if (!loggedFirstAssistantDelta.has(requestId)) {
-                    loggedFirstAssistantDelta.add(requestId);
-                    traceStage("first_assistant_delta", requestId, { replyId });
-                }
+            if (requestId && !loggedFirstAssistantDelta.has(requestId)) {
+                loggedFirstAssistantDelta.add(requestId);
+                traceStage("first_assistant_delta", requestId, { replyId });
             }
             if (activeReplyId !== replyId || !activeReplyController) {
                 startAssistantReply(replyId);
@@ -222,6 +238,10 @@ async function entry(ctx) {
                 ? data.delta
                 : "";
             if (delta) {
+                streamedReplyTextByReplyId.set(replyId, `${streamedReplyTextByReplyId.get(replyId) ?? ""}${delta}`);
+                if (requestId) {
+                    streamedReplyRequestByReplyId.set(replyId, requestId);
+                }
                 activeReplyController?.enqueue(delta);
             }
             return;
@@ -230,7 +250,8 @@ async function entry(ctx) {
             if (!content) {
                 return;
             }
-            if (requestId && streamedRequestIds.has(requestId)) {
+            if (requestId &&
+                completedStreamedRepliesByRequestId.get(requestId)?.has(normalizeReplyText(content))) {
                 return;
             }
             abortActiveReply();
@@ -241,6 +262,13 @@ async function entry(ctx) {
             return;
         }
         if (event === "assistant_done" && replyId && activeReplyId === replyId) {
+            const streamedRequestId = requestId ?? streamedReplyRequestByReplyId.get(replyId);
+            const streamedReplyText = streamedReplyTextByReplyId.get(replyId);
+            if (streamedRequestId && streamedReplyText) {
+                rememberStreamedReply(streamedRequestId, streamedReplyText);
+            }
+            streamedReplyTextByReplyId.delete(replyId);
+            streamedReplyRequestByReplyId.delete(replyId);
             try {
                 activeReplyController?.close();
             }
@@ -252,6 +280,8 @@ async function entry(ctx) {
         }
         if (event === "assistant_abort" && replyId) {
             ignoredReplyIds.add(replyId);
+            streamedReplyTextByReplyId.delete(replyId);
+            streamedReplyRequestByReplyId.delete(replyId);
             if (activeReplyId === replyId) {
                 abortActiveReply();
             }

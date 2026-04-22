@@ -52,8 +52,8 @@ class Settings(BaseModel):
 
     # LLM model selection
     interaction_agent_model: str = Field(default="google/gemini-3-flash-preview")
-    execution_agent_model: str = Field(default="anthropic/claude-sonnet-4")
-    execution_agent_search_model: str = Field(default="anthropic/claude-sonnet-4")
+    execution_agent_model: str = Field(default="google/gemini-3-flash-preview")
+    execution_agent_search_model: str = Field(default="google/gemini-3-flash-preview")
     summarizer_model: str = Field(default="anthropic/claude-sonnet-4")
     email_classifier_model: str = Field(default="anthropic/claude-sonnet-4")
 

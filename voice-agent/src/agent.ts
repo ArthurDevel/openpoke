@@ -51,11 +51,25 @@ async function entry(ctx: JobContext): Promise<void> {
 
   let pendingUserTurn = false;
   let currentRequestId: string | null = null;
-  const streamedRequestIds = new Set<string>();
+  const streamedReplyTextByReplyId = new Map<string, string>();
+  const streamedReplyRequestByReplyId = new Map<string, string>();
+  const completedStreamedRepliesByRequestId = new Map<string, Set<string>>();
   const requestStartTimes = new Map<string, number>();
   const loggedFirstAssistantStart = new Set<string>();
   const loggedFirstAssistantDelta = new Set<string>();
   const loggedTtsSayQueued = new Set<string>();
+
+  const normalizeReplyText = (value: string): string => value.trim().replace(/\s+/g, " ");
+
+  const rememberStreamedReply = (requestId: string, content: string): void => {
+    const normalized = normalizeReplyText(content);
+    if (!normalized) {
+      return;
+    }
+    const existing = completedStreamedRepliesByRequestId.get(requestId) ?? new Set<string>();
+    existing.add(normalized);
+    completedStreamedRepliesByRequestId.set(requestId, existing);
+  };
 
   const traceStage = (stage: string, requestId: string | null, extra?: Record<string, unknown>): void => {
     const id = requestId ?? "-";
@@ -76,6 +90,9 @@ async function entry(ctx: JobContext): Promise<void> {
       }
 
       const requestId = randomUUID();
+      if (currentRequestId) {
+        completedStreamedRepliesByRequestId.delete(currentRequestId);
+      }
       currentRequestId = requestId;
       requestStartTimes.set(requestId, performance.now());
       pendingUserTurn = false;
@@ -243,6 +260,10 @@ async function entry(ctx: JobContext): Promise<void> {
       }
 
       if (event === "assistant_start" && replyId) {
+        streamedReplyTextByReplyId.set(replyId, "");
+        if (requestId) {
+          streamedReplyRequestByReplyId.set(replyId, requestId);
+        }
         if (requestId && !loggedFirstAssistantStart.has(requestId)) {
           loggedFirstAssistantStart.add(requestId);
           traceStage("first_assistant_start", requestId, { replyId });
@@ -254,12 +275,9 @@ async function entry(ctx: JobContext): Promise<void> {
       }
 
       if (event === "assistant_delta" && replyId) {
-        if (requestId) {
-          streamedRequestIds.add(requestId);
-          if (!loggedFirstAssistantDelta.has(requestId)) {
-            loggedFirstAssistantDelta.add(requestId);
-            traceStage("first_assistant_delta", requestId, { replyId });
-          }
+        if (requestId && !loggedFirstAssistantDelta.has(requestId)) {
+          loggedFirstAssistantDelta.add(requestId);
+          traceStage("first_assistant_delta", requestId, { replyId });
         }
         if (activeReplyId !== replyId || !activeReplyController) {
           startAssistantReply(replyId);
@@ -270,6 +288,10 @@ async function entry(ctx: JobContext): Promise<void> {
             ? (data as { delta: string }).delta
             : "";
         if (delta) {
+          streamedReplyTextByReplyId.set(replyId, `${streamedReplyTextByReplyId.get(replyId) ?? ""}${delta}`);
+          if (requestId) {
+            streamedReplyRequestByReplyId.set(replyId, requestId);
+          }
           activeReplyController?.enqueue(delta);
         }
         return;
@@ -279,7 +301,10 @@ async function entry(ctx: JobContext): Promise<void> {
         if (!content) {
           return;
         }
-        if (requestId && streamedRequestIds.has(requestId)) {
+        if (
+          requestId &&
+          completedStreamedRepliesByRequestId.get(requestId)?.has(normalizeReplyText(content))
+        ) {
           return;
         }
         abortActiveReply();
@@ -291,6 +316,13 @@ async function entry(ctx: JobContext): Promise<void> {
       }
 
       if (event === "assistant_done" && replyId && activeReplyId === replyId) {
+        const streamedRequestId = requestId ?? streamedReplyRequestByReplyId.get(replyId);
+        const streamedReplyText = streamedReplyTextByReplyId.get(replyId);
+        if (streamedRequestId && streamedReplyText) {
+          rememberStreamedReply(streamedRequestId, streamedReplyText);
+        }
+        streamedReplyTextByReplyId.delete(replyId);
+        streamedReplyRequestByReplyId.delete(replyId);
         try {
           activeReplyController?.close();
         } catch {
@@ -302,6 +334,8 @@ async function entry(ctx: JobContext): Promise<void> {
 
       if (event === "assistant_abort" && replyId) {
         ignoredReplyIds.add(replyId);
+        streamedReplyTextByReplyId.delete(replyId);
+        streamedReplyRequestByReplyId.delete(replyId);
         if (activeReplyId === replyId) {
           abortActiveReply();
         }
