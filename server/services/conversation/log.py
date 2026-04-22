@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
+from contextvars import ContextVar
 from html import escape, unescape
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Protocol, Tuple
@@ -10,6 +11,7 @@ from ...config import get_settings
 from ...logging_config import logger
 from ...models import ChatMessage
 from ...utils.timezones import now_in_user_timezone
+from .events import get_conversation_event_hub
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - used for type checkers only
@@ -18,6 +20,7 @@ if TYPE_CHECKING:  # pragma: no cover - used for type checkers only
 
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 _CONVERSATION_LOG_PATH = _DATA_DIR / "conversation" / "poke_conversation.log"
+_CURRENT_REQUEST_ID: ContextVar[Optional[str]] = ContextVar("conversation_request_id", default=None)
 
 
 class TranscriptFormatter(Protocol):
@@ -56,6 +59,7 @@ class ConversationLog:
         self._path = path
         self._formatter = formatter
         self._lock = threading.Lock()
+        self._event_hub = get_conversation_event_hub()
         self._ensure_directory()
         self._working_memory_log = _resolve_working_memory_log()
 
@@ -144,6 +148,12 @@ class ConversationLog:
     def record_reply(self, content: str) -> None:
         timestamp = self._append("poke_reply", content)
         self._working_memory_log.append_entry("poke_reply", content, timestamp)
+        self._event_hub.publish(
+            "assistant_reply",
+            content=content,
+            timestamp=timestamp,
+            request_id=get_current_request_id(),
+        )
 
     def record_wait(self, reason: str) -> None:
         """Record a wait marker that should not reach the user-facing chat history."""
@@ -216,6 +226,18 @@ _conversation_log = ConversationLog(_CONVERSATION_LOG_PATH)
 
 def get_conversation_log() -> ConversationLog:
     return _conversation_log
+
+
+def get_current_request_id() -> Optional[str]:
+    return _CURRENT_REQUEST_ID.get()
+
+
+def set_current_request_id(request_id: Optional[str]):
+    return _CURRENT_REQUEST_ID.set(request_id)
+
+
+def reset_current_request_id(token) -> None:
+    _CURRENT_REQUEST_ID.reset(token)
 
 
 __all__ = ["ConversationLog", "get_conversation_log"]

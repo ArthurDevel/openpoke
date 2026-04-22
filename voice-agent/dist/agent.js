@@ -1,130 +1,253 @@
 import "dotenv/config";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { WorkerOptions, cli, defineAgent, voice } from "@livekit/agents";
-import * as deepgram from "@livekit/agents-plugin-deepgram";
+import { WorkerOptions, cli, defineAgent, voice, } from "@livekit/agents";
+import { VAD } from "@livekit/agents-plugin-silero";
+import { STT as XaiSTT } from "@livekit/agents-plugin-xai";
+import { NoiseCancellation } from "@livekit/noise-cancellation-node";
 import { getEnv } from "./env.js";
-import { fetchChatHistory, sendChatMessage } from "./openpokeChatTool.js";
+import { sendChatMessage, subscribeChatEvents } from "./openpokeChatTool.js";
+import { XaiTTS } from "./xaiTts.js";
 const env = getEnv();
-const HISTORY_POLL_INTERVAL_MS = 1000;
-const KNOWN_STT_REJECTION_MESSAGE_PREFIX = "failed to recognize speech after";
-const KNOWN_STT_REJECTION_STACK_FRAGMENT = "SpeechStream.mainTask";
-const KNOWN_STT_ABORTED_ERROR_MESSAGE = "WebSocket connection aborted";
-const KNOWN_STT_ERROR_LABEL = "inference.STT";
-const KNOWN_UNHANDLED_ERROR_CODE = "ERR_UNHANDLED_ERROR";
-function isIgnorableWrappedSttShutdownError(reason) {
-    const wrappedReason = reason;
-    return wrappedReason.code === KNOWN_UNHANDLED_ERROR_CODE
-        && wrappedReason.context?.type === "stt_error"
-        && wrappedReason.context?.label === KNOWN_STT_ERROR_LABEL
-        && wrappedReason.context?.error?.message === KNOWN_STT_ABORTED_ERROR_MESSAGE
-        && wrappedReason.message.includes(KNOWN_STT_ABORTED_ERROR_MESSAGE)
-        && typeof wrappedReason.stack === "string"
-        && wrappedReason.stack.includes(KNOWN_STT_REJECTION_STACK_FRAGMENT);
+const USER_TURN_ENDPOINTING_DELAY_MS = 1200;
+function asTextStream(stream) {
+    return stream;
 }
-function isIgnorableSttShutdownRejection(reason) {
-    if (!(reason instanceof Error)) {
-        return false;
-    }
-    const hasKnownMessage = reason.message.startsWith(KNOWN_STT_REJECTION_MESSAGE_PREFIX);
-    const hasKnownStack = typeof reason.stack === "string" && reason.stack.includes(KNOWN_STT_REJECTION_STACK_FRAGMENT);
-    return (hasKnownMessage && hasKnownStack) || isIgnorableWrappedSttShutdownError(reason);
-}
-process.on("unhandledRejection", (reason) => {
-    if (isIgnorableSttShutdownRejection(reason)) {
-        console.warn("[openpoke-voice-agent] ignoring known STT shutdown rejection");
-        return;
-    }
-    setImmediate(() => {
-        throw reason instanceof Error ? reason : new Error(String(reason));
+async function prewarm(proc) {
+    const userData = proc.userData;
+    userData.vad = await VAD.load({
+        minSilenceDuration: 800,
     });
-});
+}
 async function entry(ctx) {
-    await ctx.connect();
-    await ctx.waitForParticipant();
-    const agent = new voice.Agent({
+    const userData = ctx.proc.userData;
+    const vad = userData.vad;
+    if (!vad) {
+        throw new Error("Silero VAD was not prewarmed");
+    }
+    const stt = new XaiSTT({
+        apiKey: env.xaiApiKey,
+        language: env.livekitSttLanguage,
+        interimResults: true,
+    });
+    let pendingUserTurn = false;
+    let currentRequestId = null;
+    const streamedRequestIds = new Set();
+    class TransportAgent extends voice.Agent {
+        async onUserTurnCompleted(_chatCtx, newMessage) {
+            const transcript = newMessage.textContent?.trim();
+            if (!transcript) {
+                pendingUserTurn = false;
+                return;
+            }
+            const requestId = randomUUID();
+            currentRequestId = requestId;
+            pendingUserTurn = false;
+            console.info("[openpoke-voice-agent] completed user turn", { transcript });
+            await sendChatMessage(env, transcript, requestId);
+        }
+    }
+    const agent = new TransportAgent({
         instructions: env.livekitInstructions,
     });
     const session = new voice.AgentSession({
-        stt: env.livekitSttModel,
-        tts: new deepgram.TTS({
-            apiKey: env.deepgramApiKey,
-            model: env.livekitTtsModel,
+        vad,
+        stt,
+        tts: new XaiTTS({
+            apiKey: env.xaiApiKey,
+            voice: env.livekitTtsVoice,
+            speed: 1.25,
         }),
+        aecWarmupDuration: 0,
         turnHandling: {
-            turnDetection: "stt",
+            turnDetection: "vad",
+            endpointing: {
+                minDelay: USER_TURN_ENDPOINTING_DELAY_MS,
+            },
+            interruption: {
+                enabled: true,
+                mode: "adaptive",
+            },
+            preemptiveGeneration: {
+                enabled: false,
+            },
         },
     });
     const closed = new Promise((resolve) => {
         session.on(voice.AgentSessionEventTypes.Close, () => resolve());
     });
-    let speechChain = Promise.resolve();
-    let lastSeenMessageCount = 0;
     let stopped = false;
+    let userSpeaking = false;
+    let activeReplyId = null;
+    let activeReplyController = null;
+    let activeReplyHandle = null;
+    const ignoredReplyIds = new Set();
+    const eventsAbortController = new AbortController();
+    const clearActiveReply = () => {
+        activeReplyId = null;
+        activeReplyController = null;
+        activeReplyHandle = null;
+    };
+    const abortActiveReply = () => {
+        if (activeReplyId) {
+            ignoredReplyIds.add(activeReplyId);
+        }
+        try {
+            activeReplyController?.close();
+        }
+        catch {
+            // Ignore duplicate close errors.
+        }
+        activeReplyHandle?.interrupt(true);
+        clearActiveReply();
+    };
+    const startAssistantReply = (replyId) => {
+        abortActiveReply();
+        const textStream = new ReadableStream({
+            start(controller) {
+                activeReplyController = controller;
+            },
+            cancel() {
+                ignoredReplyIds.add(replyId);
+            },
+        });
+        activeReplyId = replyId;
+        const handle = session.say(asTextStream(textStream), {
+            allowInterruptions: true,
+            addToChatCtx: false,
+        });
+        handle.addDoneCallback((doneHandle) => {
+            if (doneHandle.interrupted) {
+                ignoredReplyIds.add(replyId);
+            }
+            if (activeReplyHandle === handle) {
+                try {
+                    activeReplyController?.close();
+                }
+                catch {
+                    // Ignore duplicate close errors.
+                }
+                clearActiveReply();
+            }
+        });
+        activeReplyHandle = handle;
+    };
+    console.info("[openpoke-voice-agent] job assigned");
+    await ctx.connect();
     await session.start({
         agent,
         room: ctx.room,
         record: false,
+        inputOptions: {
+            noiseCancellation: NoiseCancellation(),
+            textEnabled: false,
+        },
     });
-    try {
-        lastSeenMessageCount = (await fetchChatHistory(env)).length;
-    }
-    catch (error) {
-        console.warn("[openpoke-voice-agent] failed to read initial chat history", error);
-    }
-    const historyPoller = setInterval(() => {
-        if (stopped) {
+    const participant = await ctx.waitForParticipant();
+    console.info("[openpoke-voice-agent] participant joined", {
+        participantIdentity: participant.identity,
+    });
+    session.on(voice.AgentSessionEventTypes.UserStateChanged, (event) => {
+        userSpeaking = event.newState === "speaking";
+        pendingUserTurn = event.newState !== "listening";
+    });
+    const assistantEventsTask = subscribeChatEvents(env, async ({ event, data }) => {
+        if (stopped || !data || typeof data !== "object") {
             return;
         }
-        speechChain = speechChain
-            .then(async () => {
-            const messages = await fetchChatHistory(env);
-            const newMessages = messages.slice(lastSeenMessageCount);
-            lastSeenMessageCount = messages.length;
-            for (const entry of newMessages) {
-                if (entry.role !== "assistant" || typeof entry.content !== "string") {
-                    continue;
-                }
-                const text = entry.content.trim();
-                if (!text) {
-                    continue;
-                }
-                const handle = session.say(text, {
-                    allowInterruptions: true,
-                    addToChatCtx: false,
-                });
-                await handle.waitForPlayout();
+        const replyId = typeof data.reply_id === "string"
+            ? data.reply_id
+            : null;
+        const requestId = typeof data.request_id === "string"
+            ? data.request_id
+            : null;
+        const content = typeof data.content === "string"
+            ? data.content.trim()
+            : "";
+        if (currentRequestId && requestId !== currentRequestId) {
+            return;
+        }
+        if (replyId && ignoredReplyIds.has(replyId)) {
+            if (event === "assistant_done" || event === "assistant_abort") {
+                ignoredReplyIds.delete(replyId);
             }
-        })
-            .catch((error) => {
-            console.error("[openpoke-voice-agent] failed to narrate new assistant messages", error);
-        });
-    }, HISTORY_POLL_INTERVAL_MS);
-    session.on(voice.AgentSessionEventTypes.UserInputTranscribed, (event) => {
-        if (!event.isFinal) {
             return;
         }
-        const transcript = event.transcript.trim();
-        if (!transcript) {
+        if (userSpeaking || pendingUserTurn) {
+            if (event === "assistant_abort" && replyId) {
+                ignoredReplyIds.add(replyId);
+            }
             return;
         }
-        speechChain = speechChain
-            .then(async () => {
-            await sendChatMessage(env, transcript);
-        })
-            .catch((error) => {
-            console.error("[openpoke-voice-agent] failed to send chat message", error);
-        });
+        if (event === "assistant_start" && replyId) {
+            if (!userSpeaking) {
+                startAssistantReply(replyId);
+            }
+            return;
+        }
+        if (event === "assistant_delta" && replyId) {
+            if (requestId) {
+                streamedRequestIds.add(requestId);
+            }
+            if (activeReplyId !== replyId || !activeReplyController) {
+                startAssistantReply(replyId);
+            }
+            const delta = typeof data.delta === "string"
+                ? data.delta
+                : "";
+            if (delta) {
+                activeReplyController?.enqueue(delta);
+            }
+            return;
+        }
+        if (event === "assistant_reply") {
+            if (!content) {
+                return;
+            }
+            if (requestId && streamedRequestIds.has(requestId)) {
+                return;
+            }
+            abortActiveReply();
+            await session.say(content, {
+                allowInterruptions: true,
+                addToChatCtx: false,
+            }).waitForPlayout();
+            return;
+        }
+        if (event === "assistant_done" && replyId && activeReplyId === replyId) {
+            try {
+                activeReplyController?.close();
+            }
+            catch {
+                // Ignore duplicate close errors.
+            }
+            clearActiveReply();
+            return;
+        }
+        if (event === "assistant_abort" && replyId) {
+            ignoredReplyIds.add(replyId);
+            if (activeReplyId === replyId) {
+                abortActiveReply();
+            }
+        }
+    }, eventsAbortController.signal).catch((error) => {
+        if (!stopped) {
+            console.error("[openpoke-voice-agent] assistant event stream failed", error);
+        }
     });
     await session.say(env.livekitGreeting, {
         allowInterruptions: true,
         addToChatCtx: false,
     }).waitForPlayout();
-    await closed.finally(() => {
+    await closed.finally(async () => {
         stopped = true;
-        clearInterval(historyPoller);
+        eventsAbortController.abort();
+        abortActiveReply();
+        await Promise.allSettled([assistantEventsTask, stt.close()]);
     });
 }
 const worker = defineAgent({
+    prewarm,
     entry,
 });
 export default worker;

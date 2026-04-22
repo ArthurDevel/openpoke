@@ -1,8 +1,12 @@
+import asyncio
+import json
+
 from fastapi import APIRouter
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..models import ChatHistoryClearResponse, ChatHistoryResponse, ChatRequest
 from ..services import get_conversation_log, get_trigger_service, handle_chat_request
+from ..services.conversation import get_conversation_event_hub
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -20,6 +24,36 @@ async def chat_send(
 def chat_history() -> ChatHistoryResponse:
     log = get_conversation_log()
     return ChatHistoryResponse(messages=log.to_chat_messages())
+
+
+@router.get("/events", response_class=StreamingResponse)
+async def chat_events() -> StreamingResponse:
+    hub = get_conversation_event_hub()
+    queue = hub.subscribe()
+
+    async def event_stream():
+        try:
+            yield "event: ready\ndata: {}\n\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+
+                payload = json.dumps(event, ensure_ascii=True)
+                yield f"event: {event['type']}\ndata: {payload}\n\n"
+        finally:
+            hub.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.delete("/history", response_model=ChatHistoryClearResponse)

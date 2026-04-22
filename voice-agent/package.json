@@ -9,14 +9,19 @@
     "start": "node dist/agent.js start"
   },
   "dependencies": {
-    "@livekit/agents": "1.2.7",
-    "@livekit/agents-plugin-deepgram": "1.2.7",
+    "@livekit/agents": "1.2.8",
+    "@livekit/agents-plugin-openai": "1.2.8",
+    "@livekit/agents-plugin-silero": "1.2.8",
+    "@livekit/agents-plugin-xai": "1.2.8",
+    "@livekit/noise-cancellation-node": "^0.1.9",
     "@livekit/rtc-node": "0.13.25",
     "dotenv": "^16.4.7",
+    "ws": "^8.20.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/ws": "^8.5.16",
     "tsx": "^4.19.3",
     "typescript": "^5.8.3"
   }

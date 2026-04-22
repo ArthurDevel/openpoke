@@ -29,6 +29,7 @@ class ChatRequest(BaseModel):
     messages: List[ChatMessage] = Field(default_factory=list)
     model: Optional[str] = None
     system: Optional[str] = None
+    request_id: Optional[str] = None
     stream: bool = True
 
     def openrouter_messages(self) -> List[Dict[str, str]]:
